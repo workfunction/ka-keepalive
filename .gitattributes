@@ -1,0 +1,6 @@
+# Shell scripts must keep LF line endings (bash on Windows/Git Bash rejects CRLF); Python/JSON/Markdown too.
+*.sh      text eol=lf
+*.py      text eol=lf
+bin/kactl text eol=lf
+*.md      text eol=lf
+*.cmd     text eol=crlf

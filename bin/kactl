@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""kactl: manual control for the ka keepalive proxy (metadata only; stdlib; Python 3.10+).
+
+Run it with the interpreter the installer chose, e.g. `python3 ~/.claude/ka/bin/kactl status`
+(Windows: `kactl.cmd status` in ~/.claude/ka/bin, or `py -3 "%USERPROFILE%/.claude/ka/bin/kactl" status`).
+
+  kactl status [<sid-prefix>]           this session's line (default: $CLAUDE_CODE_SESSION_ID)
+  kactl status all                      one line per tracked session (from STATE_DIR/status.json)
+  kactl stop [<sid-prefix>|all]         stop pings for one session (stop/<sid>) or all (global off file)
+  kactl resume|start [<sid-prefix>|all] clear that session's stop flag, or all flags + global off
+  kactl extend [<sid-prefix>] <hours>   keep pinging until now + hours, even past the dynamic cap
+                                        (0 < hours <= 24); hours 0 removes the extension
+  kactl off | on                        global off / on
+
+Without <sid-prefix>, status/stop/resume/start/extend act on $CLAUDE_CODE_SESSION_ID (set inside every
+Claude Code Bash tool); if it is unset they refuse. A stop takes effect within one proxy tick and drops
+the stored request from memory. A stopped/capped/expired session restarts on its NEXT real request
+(resume and extend do not replay). STATE_DIR = $KA_STATE_DIR or ~/.claude/ka.
+"""
+import hashlib, json, os, re, sys, time
+
+STATE = os.path.expanduser(os.environ.get("KA_STATE_DIR", "~/.claude/ka"))
+OFF = os.path.join(STATE, "off")
+STOP = os.path.join(STATE, "stop")
+EXTEND = os.path.join(STATE, "extend")
+SID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+EXTEND_MAX_H = 24
+
+
+def log_sid(sid):
+    """Same rule as ka_proxy.log_sid: status.json lists a canonical UUID as-is, anything else hashed."""
+    return sid if _UUID_RE.fullmatch(sid) else "h-" + hashlib.sha256(sid.encode()).hexdigest()[:12]
+
+
+def env_sid():
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not sid:
+        sys.exit("kactl: no session given and CLAUDE_CODE_SESSION_ID is unset (pass a sid-prefix or 'all')")
+    if not SID_RE.fullmatch(sid):
+        sys.exit("kactl: CLAUDE_CODE_SESSION_ID has an unexpected shape; pass a sid-prefix")
+    return sid
+
+
+def load_status():
+    try:
+        with open(os.path.join(STATE, "status.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def stop_flags():
+    try:
+        return sorted(n for n in os.listdir(STOP) if SID_RE.fullmatch(n))
+    except OSError:
+        return []
+
+
+def touch(path):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    open(path, "a").close()
+
+
+def rm(path):
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def resolve(prefix, known):
+    """Unique sid for a prefix among known sids (tracked sessions + existing flags)."""
+    hits = sorted({s for s in known if s.startswith(prefix)})
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        sys.exit(f"kactl: no tracked session matches '{prefix}' (see: kactl status)")
+    sys.exit(f"kactl: '{prefix}' is ambiguous: " + ", ".join(h[:12] for h in hits))
+
+
+def fmt_min(s):
+    return "-" if s is None else f"{s / 60:.0f}m"
+
+
+def cmd_status():
+    st = load_status()
+    flags = stop_flags()
+    if st is None:
+        print(f"no status at {STATE}/status.json (proxy not running?)")
+        print("global: " + ("OFF" if os.path.exists(OFF) else "on") + (f"; stop flags: {len(flags)}" if flags else ""))
+        return 0
+    now = time.time()
+    age = now - float(st.get("updated") or 0)
+    stale = age > 120
+    print(f"proxy pid {st.get('proxy_pid')}  status age {age:.0f}s{'  (STALE: proxy not running?)' if stale else ''}"
+          f"  global: {'OFF' if st.get('global_off') or os.path.exists(OFF) else 'on'}")
+    rows = [r for r in st.get("sessions") or [] if isinstance(r, dict) and isinstance(r.get("sid"), str)]
+    if not rows:
+        print("  (no tracked sessions)")
+    else:
+        print(f"  {'sid':<10}{'model':<20}{'prefix':>9}{'idle':>7}{'pings':>7}{'cap_left':>10}  state")
+    flags = set(stop_flags())
+    for r in sorted(rows, key=lambda r: -(r.get("last_real_ts") or 0)):
+        state = r.get("state", "?")
+        if state in ("active", "retry-wait") and r.get("next_ping_ts"):
+            state += f" (next {'retry' if state == 'retry-wait' else 'ping'} in {fmt_min(max(0, r['next_ping_ts'] - now))})"
+        elif r.get("stop_reason"):
+            state += f" ({r['stop_reason']})"
+        if r["sid"] in flags:
+            state += " [stop flag]"
+        idle = now - r["last_real_ts"] if r.get("last_real_ts") else None
+        cap_left = max(0, r["cap_end_ts"] - now) if r.get("cap_end_ts") else None
+        print(f"  {r['sid'][:8]:<10}{(r.get('model') or '?')[:19]:<20}{r.get('prefix_tokens') or 0:>9}"
+              f"{fmt_min(idle):>7}{r.get('pings') or 0:>7}{fmt_min(cap_left):>10}  {state}")
+    t = st.get("today") or {}
+    if t:
+        stops = ", ".join(f"{k} {v}" for k, v in sorted((t.get("stops") or {}).items()) if v) or "none"
+        print(f"today: {t.get('pings', 0)} pings ${t.get('ping_usd', 0):.2f}  avoided rewarm "
+              f"${t.get('avoided_rewarm_usd', 0):.2f}  stops: {stops}")
+    return 0
+
+
+def hhmm(ts):
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+def find_row(st, sid=None, prefix=None):
+    rows = [r for r in (st or {}).get("sessions") or [] if isinstance(r, dict) and isinstance(r.get("sid"), str)]
+    want = (sid, log_sid(sid)) if sid is not None else (resolve(prefix, [r["sid"] for r in rows]),)
+    return next((r for r in rows if r["sid"] in want), None)
+
+
+def cmd_status_one(sid=None, prefix=None):
+    """One session's line: state, prefix, idle, next ping, cap end (incl. extension), pings."""
+    st = load_status()
+    r = find_row(st, sid, prefix)
+    if r is None:
+        print("kactl: this session is not tracked yet — send one message through the proxy first")
+        return 1
+    now = time.time()
+    state = r.get("state", "?") + (f" ({r['stop_reason']})" if r.get("stop_reason") else "")
+    if r["sid"] in set(stop_flags()) or (sid and sid in set(stop_flags())):
+        state += " [stop flag]"
+    nxt = f"in {fmt_min(max(0, r['next_ping_ts'] - now))}" if r.get("next_ping_ts") else "-"
+    cap = "-"
+    if r.get("cap_end_ts"):
+        cap = f"{hhmm(r['cap_end_ts'])} (in {fmt_min(max(0, r['cap_end_ts'] - now))})"
+        if r.get("extend_until_ts"):
+            cap += " extended"
+    idle = fmt_min(now - r["last_real_ts"]) if r.get("last_real_ts") else "-"
+    print(f"{r['sid'][:8]}  {state}  prefix {r.get('prefix_tokens') or 0}  idle {idle}  next ping {nxt}"
+          f"  cap end {cap}  pings {r.get('pings') or 0}")
+    if st and (st.get("global_off") or os.path.exists(OFF)):
+        print("note: global OFF is set (kactl on)")
+    return 0
+
+
+def cmd_extend(sid, hours_arg, row):
+    try:
+        hours = float(hours_arg)
+    except ValueError:
+        hours = float("nan")
+    if not (hours == hours and 0 <= hours <= EXTEND_MAX_H):   # rejects NaN and inf
+        sys.exit(f"kactl: extend hours must be a number in 0..{EXTEND_MAX_H} (0 removes the extension)")
+    path = os.path.join(EXTEND, sid)
+    if hours == 0:
+        print(f"extension removed for {sid[:12]}" if rm(path) else f"{sid[:12]} had no extension")
+        return 0
+    deadline = time.time() + hours * 3600
+    os.makedirs(EXTEND, mode=0o700, exist_ok=True)
+    tmp = os.path.join(EXTEND, f".{sid}.tmp{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"{deadline:.3f}\n")
+    for i in range(20):   # Windows: the proxy may hold the old file open for a moment
+        try:
+            os.replace(tmp, path)
+            break
+        except PermissionError:
+            if os.name != "nt" or i == 19:
+                raise
+            time.sleep(0.05)
+    print(f"extended {sid[:12]} until {hhmm(deadline)} ({hours:g} h past now); the proxy applies it within one tick")
+    state = (row or {}).get("state")
+    if row is None:
+        print("note: not tracked yet — the extension applies once a message goes through the proxy")
+    elif state not in ("active", "retry-wait"):
+        print(f"note: session is {state}: the extension applies on its next real request")
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd, args = argv[0], argv[1:]
+    if cmd == "start":
+        cmd = "resume"
+    if cmd == "status" and args == ["all"]:
+        return cmd_status()
+    if cmd == "status" and len(args) <= 1:
+        return cmd_status_one(sid=env_sid()) if not args else cmd_status_one(prefix=args[0])
+    if cmd == "extend" and len(args) in (1, 2):
+        if len(args) == 1:
+            sid = env_sid()
+            row = find_row(load_status(), sid=sid)
+        else:
+            st = load_status() or {}
+            sid = resolve(args[0], [r["sid"] for r in st.get("sessions") or []])
+            row = find_row(st, sid=sid)
+        if not SID_RE.fullmatch(sid):
+            sys.exit(f"kactl: refusing unsafe sid '{sid}'")
+        return cmd_extend(sid, args[-1], row)
+    if cmd in ("stop", "resume") and not args:   # this Claude Code session, exact sid
+        sid = env_sid()
+        if cmd == "stop":
+            touch(os.path.join(STOP, sid))
+            print(f"stop flag set for {sid[:12]}: stops within one tick")
+        else:
+            n = rm(os.path.join(STOP, sid)) + (log_sid(sid) != sid and rm(os.path.join(STOP, log_sid(sid))))
+            print(f"stop flag cleared for {sid[:12]}" if n else f"{sid[:12]} had no stop flag")
+            if os.path.exists(OFF):
+                print("note: global OFF is still set (kactl on)")
+        return 0
+    if cmd == "off" and not args:
+        touch(OFF)
+        print("global OFF: all sessions stop within one tick")
+        return 0
+    if cmd == "on" and not args:
+        print("global on" + ("" if rm(OFF) else " (was not off)"))
+        return 0
+    if cmd in ("stop", "resume") and len(args) == 1:
+        target = args[0]
+        if cmd == "stop" and target == "all":
+            touch(OFF)
+            print("global OFF: all sessions stop within one tick")
+            return 0
+        if cmd == "resume" and target == "all":
+            n = sum(rm(os.path.join(STOP, s)) for s in stop_flags())
+            rm(OFF)
+            print(f"cleared global off + {n} stop flag(s); sessions restart on their next real request")
+            return 0
+        st = load_status() or {}
+        known = [r["sid"] for r in st.get("sessions") or []] + stop_flags()
+        sid = resolve(target, known)
+        if not SID_RE.fullmatch(sid):
+            sys.exit(f"kactl: refusing unsafe sid '{sid}'")
+        if cmd == "stop":
+            touch(os.path.join(STOP, sid))
+            print(f"stop flag set for {sid[:12]}: stops within one tick")
+        else:
+            print(f"stop flag cleared for {sid[:12]}" if rm(os.path.join(STOP, sid)) else f"{sid[:12]} had no stop flag")
+            if os.path.exists(OFF):
+                print("note: global OFF is still set (kactl on)")
+        return 0
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
